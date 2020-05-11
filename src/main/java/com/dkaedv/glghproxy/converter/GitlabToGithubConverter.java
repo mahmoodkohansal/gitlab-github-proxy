@@ -5,6 +5,8 @@ import java.util.HashMap;
 import java.util.List;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.eclipse.egit.github.core.Comment;
 import org.eclipse.egit.github.core.Commit;
 import org.eclipse.egit.github.core.CommitFile;
@@ -19,21 +21,26 @@ import org.eclipse.egit.github.core.RepositoryHook;
 import org.eclipse.egit.github.core.TypedResource;
 import org.eclipse.egit.github.core.User;
 import org.eclipse.egit.github.core.event.Event;
+import org.eclipse.egit.github.core.event.EventRepository;
 import org.eclipse.egit.github.core.event.PullRequestPayload;
 import org.gitlab.api.models.GitlabBranch;
 import org.gitlab.api.models.GitlabCommit;
 import org.gitlab.api.models.GitlabCommitDiff;
 import org.gitlab.api.models.GitlabMergeRequest;
 import org.gitlab.api.models.GitlabMilestone;
+import org.gitlab.api.models.GitlabNamespace;
 import org.gitlab.api.models.GitlabNote;
 import org.gitlab.api.models.GitlabProject;
 import org.gitlab.api.models.GitlabProjectHook;
 import org.gitlab.api.models.GitlabUser;
 
+import com.dkaedv.glghproxy.Application;
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 public class GitlabToGithubConverter {
+
+	private static final Log LOG = LogFactory.getLog(GitlabToGithubConverter.class);
+
 	public static RepositoryBranch convertBranch(GitlabBranch glbranch) {
 		RepositoryBranch branch = new RepositoryBranch();
 		branch.setName(glbranch.getName());
@@ -56,14 +63,15 @@ public class GitlabToGithubConverter {
 		return branches;
 	}
 
-	public static RepositoryCommit convertCommit(GitlabCommit glcommit, List<GitlabCommitDiff> gldiffs, GitlabUser gluser) {
+	public static RepositoryCommit convertCommit(GitlabCommit glcommit, List<GitlabCommitDiff> gldiffs,
+			GitlabUser gluser) {
 		RepositoryCommit repoCommit = new RepositoryCommit();
 
 		repoCommit.setSha(glcommit.getId());
 
 		Commit commit = new Commit();
 		commit.setMessage(glcommit.getTitle());
-		
+
 		CommitUser commitUser = new CommitUser();
 		commitUser.setName(glcommit.getAuthorName());
 		commitUser.setEmail(glcommit.getAuthorEmail());
@@ -89,21 +97,25 @@ public class GitlabToGithubConverter {
 			}
 			repoCommit.setParents(parents);
 		}
-		
+
 		if (gldiffs != null) {
 			List<CommitFile> files = new ArrayList<>(gldiffs.size());
 			for (GitlabCommitDiff diff : gldiffs) {
 				convertCommitFile(files, diff);
 			}
 			repoCommit.setFiles(files);
+		} else {
+			repoCommit.setFiles(new ArrayList<>()); // must set empty collection, other DVCS connector fails
 		}
-		
+
 		return repoCommit;
 	}
 
 	private static void convertCommitFile(List<CommitFile> files, GitlabCommitDiff diff) {
-		int additions = StringUtils.countMatches(diff.getDiff(), "\n+") - StringUtils.countMatches(diff.getDiff(), "\n+++");
-		int deletions = StringUtils.countMatches(diff.getDiff(), "\n-") - StringUtils.countMatches(diff.getDiff(), "\n---");
+		int additions = StringUtils.countMatches(diff.getDiff(), "\n+")
+				- StringUtils.countMatches(diff.getDiff(), "\n+++");
+		int deletions = StringUtils.countMatches(diff.getDiff(), "\n-")
+				- StringUtils.countMatches(diff.getDiff(), "\n---");
 
 		if (diff.getNewFile()) {
 			CommitFile file = new CommitFile();
@@ -141,45 +153,67 @@ public class GitlabToGithubConverter {
 			file.setDeletions(deletions);
 			file.setChanges(additions + deletions);
 			files.add(file);
-		}				
+		}
 	}
-	
-	public static Repository convertRepository(GitlabProject project) {
+
+	public static Repository convertRepository(GitlabProject project, boolean treatOrgaAsOwner) {
 		Repository repo = new Repository();
-		
+
 		repo.setId(project.getId());
-		repo.setName(project.getName());
-		
+		repo.setName(project.getPath()); // note: use the path, not the friendly name that we cannot use path to the API
+		repo.setDescription(project.getDescription());
+		repo.setGitUrl(project.getHttpUrl());
+		repo.setHtmlUrl(project.getWebUrl());
+		repo.setDefaultBranch(project.getDefaultBranch());
+		GitlabProject glForkedFrom = project.getForkedFrom();
+		repo.setFork(glForkedFrom != null);
+		if (glForkedFrom != null) {
+			Repository source = new Repository();
+			source.setId(glForkedFrom.getId());
+			source.setName(glForkedFrom.getName());
+			source.setHtmlUrl(glForkedFrom.getWebUrl());
+			repo.setSource(source);
+		}
+
 		User user = new User();
-		user.setLogin(project.getNamespace().getName());
+		GitlabNamespace namespace = project.getNamespace();
+		if (namespace != null) {
+			if (treatOrgaAsOwner) {
+				user.setLogin(namespace.getFullPath()); // include subgroups
+			} else {
+				user.setLogin(namespace.getName());
+			}
+		}
 		repo.setOwner(user);
-		
+
 		return repo;
 	}
 
-	public static List<Repository> convertRepositories(List<GitlabProject> projects) {
+	public static List<Repository> convertRepositories(List<GitlabProject> projects, boolean treatOrgaAsOwner) {
 		List<Repository> repos = new ArrayList<>(projects.size());
-		
+
 		for (GitlabProject project : projects) {
-			repos.add(convertRepository(project));
+			repos.add(convertRepository(project, treatOrgaAsOwner));
 		}
-		
+
 		return repos;
 	}
 
-	public static List<PullRequest> convertMergeRequests(List<GitlabMergeRequest> glmergerequests, String gitlabUrl, String namespace, String repo) {
+	public static List<PullRequest> convertMergeRequests(List<GitlabMergeRequest> glmergerequests, String gitlabUrl,
+			String namespace, String repo) {
 		List<PullRequest> pulls = new ArrayList<>(glmergerequests.size());
-		
+
 		for (GitlabMergeRequest glmr : glmergerequests) {
 			pulls.add(convertMergeRequest(glmr, gitlabUrl, namespace, repo));
 		}
-		
+
 		return pulls;
 	}
 
-	public static PullRequest convertMergeRequest(GitlabMergeRequest glmr, String gitlabUrl, String namespace, String repo) {
+	public static PullRequest convertMergeRequest(GitlabMergeRequest glmr, String gitlabUrl, String namespace,
+			String repo) {
 		PullRequest pull = new PullRequest();
-		
+
 		pull.setAssignee(convertUser(glmr.getAssignee()));
 		pull.setUser(convertUser(glmr.getAuthor()));
 		pull.setCreatedAt(glmr.getCreatedAt());
@@ -191,34 +225,41 @@ public class GitlabToGithubConverter {
 		pull.setBase(createPullRequestMarker(glmr.getTargetBranch(), namespace, repo));
 		convertMergeRequestState(pull, glmr);
 		pull.setTitle(glmr.getTitle());
-		
+
 		if (glmr.getUpdatedAt() != null) {
 			pull.setUpdatedAt(glmr.getUpdatedAt());
 		} else {
 			pull.setUpdatedAt(glmr.getCreatedAt());
 		}
-		
-		pull.setHtmlUrl(gitlabUrl + "/" + namespace + "/" + repo + "/merge_requests/" + glmr.getIid());
-		
-		//LOG.info("Converted merge request " + convertToJson(glmr) + " to pull request " + convertToJson(pull));
-		
+
+		String htmlUrl = gitlabUrl + "/" + namespace + "/" + repo + "/merge_requests/" + glmr.getIid();
+		pull.setHtmlUrl(htmlUrl);
+		pull.setDiffUrl(htmlUrl + ".diff");
+		pull.setPatchUrl(htmlUrl + ".patch");
+
+		// LOG.info("Converted merge request " + convertToJson(glmr) + " to pull request " + convertToJson(pull));
+
 		return pull;
 	}
 
 	private static void convertMergeRequestState(PullRequest pull, GitlabMergeRequest glmr) {
-		if ("opened".equals(glmr.getState()) || "reopened".equals(glmr.getState())) {
+		if ("can_be_merged".equals(glmr.getMergeStatus())) {
+			pull.setMergeable(true);
+		}
+
+		if (GitlabMergeRequest.STATUS_OPENED.equals(glmr.getState()) || "reopened".equals(glmr.getState())) {
 			pull.setState("open");
 			pull.setMerged(false);
-		} else if ("closed".equals(glmr.getState())) {
+		} else if (GitlabMergeRequest.STATUS_CLOSED.equals(glmr.getState())) {
 			pull.setState("closed");
 			pull.setMerged(false);
 			pull.setClosedAt(glmr.getUpdatedAt());
-		} else if ("merged".equals(glmr.getState())) {
+		} else if (GitlabMergeRequest.STATUS_MERGED.equals(glmr.getState())) {
 			pull.setState("closed");
 			pull.setMerged(true);
 			pull.setClosedAt(glmr.getUpdatedAt());
 			pull.setMergedAt(glmr.getUpdatedAt());
-			
+
 			if (glmr.getAssignee() != null) {
 				pull.setMergedBy(convertUser(glmr.getAssignee()));
 			} else {
@@ -233,16 +274,15 @@ public class GitlabToGithubConverter {
 		PullRequestMarker marker = new PullRequestMarker();
 		marker.setLabel(branch);
 		marker.setRef(branch);
-		
-		
+
 		Repository repo = new Repository();
 		repo.setName(reponame);
 		User owner = new User();
 		owner.setLogin(namespace);
 		repo.setOwner(owner);
-		
+
 		marker.setRepo(repo);
-		
+
 		return marker;
 	}
 
@@ -250,15 +290,15 @@ public class GitlabToGithubConverter {
 		if (glmilestone == null) {
 			return null;
 		}
-		
+
 		Milestone milestone = new Milestone();
-		
+
 		milestone.setCreatedAt(glmilestone.getCreatedDate());
 		milestone.setDescription(glmilestone.getDescription());
 		milestone.setDueOn(glmilestone.getDueDate());
 		milestone.setState(glmilestone.getState());
 		milestone.setTitle(glmilestone.getTitle());
-		
+
 		return milestone;
 	}
 
@@ -266,108 +306,130 @@ public class GitlabToGithubConverter {
 		if (gluser == null) {
 			return null;
 		}
-		
+
 		User user = new User();
 		user.setId(gluser.getId());
 		user.setLogin(gluser.getUsername());
-		user.setAvatarUrl(gluser.getAvatarUrl());
+		String avatarUrl = gluser.getAvatarUrl();
+		if (avatarUrl != null && avatarUrl.length() > 0) {
+			user.setAvatarUrl(avatarUrl);
+		}
 		user.setBio(gluser.getBio());
 		user.setEmail(gluser.getEmail());
 		user.setName(gluser.getName());
 		user.setCreatedAt(gluser.getCreatedAt());
 		user.setType(User.TYPE_USER);
-		
+
 		return user;
 	}
 
 	public static List<RepositoryCommit> convertCommits(List<GitlabCommit> glcommits) {
 		List<RepositoryCommit> commits = new ArrayList<>(glcommits.size());
-		
+
 		for (GitlabCommit glcommit : glcommits) {
 			commits.add(convertCommit(glcommit, null, null));
 		}
-		
+
 		return commits;
 	}
 
 	public static List<Comment> convertComments(List<GitlabNote> glnotes) {
 		List<Comment> comments = new ArrayList<>(glnotes.size());
-		
+
 		for (GitlabNote glnote : glnotes) {
 			comments.add(convertComment(glnote));
 		}
-		
+
 		return comments;
 	}
 
 	private static Comment convertComment(GitlabNote glnote) {
 		Comment comment = new Comment();
-		
+
 		comment.setUser(convertUser(glnote.getAuthor()));
 		comment.setBody(glnote.getBody());
 		comment.setCreatedAt(glnote.getCreatedAt());
 		comment.setId(glnote.getId());
-		
+
 		return comment;
 	}
 
 	public static List<RepositoryHook> convertHooks(List<GitlabProjectHook> glhooks) {
 		List<RepositoryHook> hooks = new ArrayList<>(glhooks.size());
-		
+
 		for (GitlabProjectHook glhook : glhooks) {
 			hooks.add(convertHook(glhook));
 		}
-		
+
 		return hooks;
 	}
 
 	public static RepositoryHook convertHook(GitlabProjectHook glhook) {
 		RepositoryHook hook = new RepositoryHook();
-		
+
 		hook.setCreatedAt(glhook.getCreatedAt());
-		hook.setName("web");	// Always "web" for webhooks ...
+		hook.setName("web"); // Always "web" for webhooks ...
 		hook.setUrl(glhook.getUrl());
 		hook.setActive(glhook.getPushEvents() || glhook.isMergeRequestsEvents());
 		hook.setId(Integer.valueOf(glhook.getId()));
-		
+
 		hook.setConfig(new HashMap<String, String>());
 		hook.getConfig().put("url", glhook.getUrl());
-		
+
 		return hook;
 	}
-	
+
 	private static String convertToJson(Object o) {
 		try {
-			return new ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(o);
+			return Application.createObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(o);
 		} catch (JsonProcessingException e) {
 			throw new RuntimeException(e);
 		}
 	}
 
-	public static List<Event> convertMergeRequestsToEvents(List<GitlabMergeRequest> glmergerequests, String gitlabUrl, String namespace, String repo) {
+	public static List<Event> convertMergeRequestsToEvents(List<GitlabMergeRequest> glmergerequests, String gitlabUrl,
+			String namespace, String repo) {
 		List<Event> events = new ArrayList<>(glmergerequests.size());
-		
+
 		for (GitlabMergeRequest glmergerequest : glmergerequests) {
 			events.add(convertMergeRequestToEvent(glmergerequest, gitlabUrl, namespace, repo));
 		}
-		
+
 		return events;
 	}
 
-	private static Event convertMergeRequestToEvent(GitlabMergeRequest glmergerequest, String gitlabUrl, String namespace, String repo) {
+	public static Event convertMergeRequestToEvent(GitlabMergeRequest glmergerequest, String gitlabUrl,
+			String namespace, String repo) {
 		Event event = new Event();
-		
+
 		event.setType(Event.TYPE_PULL_REQUEST);
 		event.setCreatedAt(glmergerequest.getUpdatedAt());
-		
+
 		PullRequestPayload payload = new PullRequestPayload();
 		payload.setPullRequest(convertMergeRequest(glmergerequest, gitlabUrl, namespace, repo));
 		payload.setNumber(payload.getPullRequest().getNumber());
-		
+
 		event.setPayload(payload);
-		
+
 		event.setId(glmergerequest.getId() + "-" + glmergerequest.getUpdatedAt().getTime());
-				
+		EventRepository eventRepository = new EventRepository();
+		eventRepository.setId(glmergerequest.getProjectId());
+		eventRepository.setName(repo);
+		event.setRepo(eventRepository);
+
 		return event;
+	}
+
+	public static String translatePrStateToMrStatus(String aState) {
+		if ("open".equals(aState)) {
+			return GitlabMergeRequest.STATUS_OPENED;
+		}
+		if ("closed".equals(aState)) {
+			return GitlabMergeRequest.STATUS_CLOSED;
+		}
+		if ("all".equals(aState)) { // for get-merge-requests-with-status api
+			return "all";
+		}
+		throw new RuntimeException("Unknown pull request state: " + aState);
 	}
 }

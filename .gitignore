@@ -1,3 +1,6 @@
+.idea/
 /target/
 /.classpath
 /.project
+/.settings/
+glghproxy.iml

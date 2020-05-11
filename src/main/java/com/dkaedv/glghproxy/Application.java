@@ -3,10 +3,12 @@ package com.dkaedv.glghproxy;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.builder.SpringApplicationBuilder;
-import org.springframework.boot.context.web.SpringBootServletInitializer;
+import org.springframework.boot.web.servlet.support.SpringBootServletInitializer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.http.converter.json.Jackson2ObjectMapperBuilder;
 
+import com.fasterxml.jackson.annotation.JsonInclude.Include;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.PropertyNamingStrategy;
 
 @SpringBootApplication
@@ -30,12 +32,21 @@ public class Application extends SpringBootServletInitializer {
 	
 	@Bean
 	public Jackson2ObjectMapperBuilder jacksonBuilder() {
+		return createObjectMapperBuilder();
+	}
+
+	private static Jackson2ObjectMapperBuilder createObjectMapperBuilder() {
 		Jackson2ObjectMapperBuilder builder = new Jackson2ObjectMapperBuilder();
 		builder
 			.indentOutput(true)
 			.simpleDateFormat(GITHUB_DATE_FORMAT)
-			.propertyNamingStrategy(new PropertyNamingStrategy.LowerCaseWithUnderscoresStrategy());
+			.serializationInclusion(Include.NON_NULL) // include empty collections; JIRA does not like commtis without files
+			.propertyNamingStrategy(new PropertyNamingStrategy.SnakeCaseStrategy());
 		
 		return builder;
+	}
+
+	public static ObjectMapper createObjectMapper() {
+		return createObjectMapperBuilder().build();
 	}
 }
